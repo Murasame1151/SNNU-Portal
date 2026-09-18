@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- PyInstaller ----
+build/
+*.manifest
+
+# ---- 本工具运行时产生（不要把别人的配置和密码提交上来）----
+_testcfg/
+secret.bin
+config.ini
+app.log
+
+# ---- 临时/草稿 ----
+_pytmp/
+_pytmp2/
+*.tmp
+*.log
+
+# ---- 编辑器 ----
+.vscode/
+.idea/

@@ -1,0 +1,15 @@
+# 统一换行符，避免 Windows/Linux 协作时整个文件都显示为改动
+* text=auto eol=lf
+
+# 明确二进制文件，防止 git 当成文本处理
+*.exe binary
+*.ico binary
+*.png binary
+*.dll binary
+
+# Windows 批处理必须是 CRLF，否则 cmd 可能解析异常
+*.bat text eol=crlf
+
+# 中文文档在 GitHub 上按文本高亮
+*.md text
+*.py text
