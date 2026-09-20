@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import queue
 import sys
@@ -28,7 +27,7 @@ import portal
 from cfgtool import as_bool, log
 
 APP_TITLE = "校园网自动认证"
-VERSION = "2.0"
+VERSION = "2.1"
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -237,23 +236,24 @@ class App:
         self._since = time.time()
         self.cmdq = queue.Queue()      # 托盘线程 -> Tk 主线程 的可调用对象
         self.evq = queue.Queue()       # 网络线程 -> Tk 主线程 的事件
+        self.headless_reason = cfgtool.headless_reason()
+        self.root = None
 
-        self.root = tk.Tk()
-        self.root.title(APP_TITLE + " v" + VERSION)
-        self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self._set_icon()
-        self._center(430, 470)
+        if self.headless_reason is None:
+            self._build_ui()
+            self._apply_cfg_to_ui()
 
-        self._build_ui()
-        self._apply_cfg_to_ui()
-
+        # 网络线程两种模式下都要跑：无界面时它就是后台守护进程
         self.worker = NetWorker(self.cfg, self._emit_from_worker)
         self.worker.start()
 
+        if self.root is None:
+            log("以无界面模式运行（%s）：只做后台认证与保活"
+                % self.headless_reason)
+            return
+
         self._pump()
         self._tick()
-
         self._init_tray()
         if silent:
             self.root.withdraw()
@@ -265,20 +265,41 @@ class App:
             self.root.after(400, lambda: self.root.attributes("-topmost", False))
 
     # ---------------- 窗口基础 ----------------
+    def _build_ui(self):
+        """创建 Tk 窗口。只在有图形界面时调用。"""
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE + " v" + VERSION)
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._set_icon()
+        self._center(430, 470)
+        self._layout()
+
     def _set_icon(self):
-        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-        ico = os.path.join(base, "net.ico")
-        if not os.path.exists(ico):
-            try:
-                ico_dir = cfgtool.data_dir()
-                cand = os.path.join(ico_dir, "net.ico")
-                if not os.path.exists(cand):
-                    from trayicon import make_ico
-                    make_ico(cand)
-                ico = cand
-            except Exception:
-                return
+        """设置窗口图标。
+
+        Windows 用 iconbitmap（.ico）；Linux 的 Tk 不认 ico，
+        要改用 iconphoto + PNG，所以两边走不同分支。
+        """
+        base = (getattr(sys, "_MEIPASS", None)
+                or os.path.dirname(os.path.abspath(__file__)))
         try:
+            if sys.platform != "win32":
+                import iconart
+                ico_dir = cfgtool.data_dir()
+                png = os.path.join(ico_dir, "icon64.png")
+                if not os.path.exists(png):
+                    iconart.write_png(png, 64)
+                self._icon_img = tk.PhotoImage(file=png)   # 必须留引用，否则被回收
+                self.root.iconphoto(True, self._icon_img)
+                return
+            ico = os.path.join(base, "net.ico")
+            if not os.path.exists(ico):
+                cand = os.path.join(cfgtool.data_dir(), "net.ico")
+                if not os.path.exists(cand):
+                    import iconart
+                    iconart.make_ico(cand)
+                ico = cand
             self.root.iconbitmap(ico)
         except Exception:
             pass
@@ -292,24 +313,33 @@ class App:
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     # ---------------- 布局 ----------------
-    def _build_ui(self):
-        try:
-            self.root.option_add("*Font", ("Microsoft YaHei UI", 9))
-        except Exception:
-            pass
+    def _layout(self):
+        # Linux 上没有雅黑，让 Tk 自己挑一个能显示中文的字体
+        fonts = (("Microsoft YaHei UI", 9),) if sys.platform == "win32" else \
+            (("Noto Sans CJK SC", 10), ("WenQuanYi Micro Hei", 10),
+             ("DejaVu Sans", 9))
+        for fam, size in fonts:
+            try:
+                self.root.option_add("*Font", (fam, size))
+                break
+            except Exception:
+                continue
 
         bg = "#ffffff"
         self.root.configure(bg=bg)
         st = ttk.Style()
-        try:
-            st.theme_use("vista")
-        except Exception:
-            pass
+        for theme in ("vista", "clam", "default"):     # Linux 上没有 vista
+            try:
+                st.theme_use(theme)
+                break
+            except Exception:
+                continue
+        ui_font = "Microsoft YaHei UI" if sys.platform == "win32" else "TkDefaultFont"
         st.configure("Card.TFrame", background=bg)
         st.configure("Card.TLabel", background=bg)
-        st.configure("H1.TLabel", background=bg, font=("Microsoft YaHei UI", 12, "bold"))
+        st.configure("H1.TLabel", background=bg, font=(ui_font, 12, "bold"))
         st.configure("Dim.TLabel", background=bg, foreground="#6b7280")
-        st.configure("Big.TButton", font=("Microsoft YaHei UI", 10, "bold"), padding=6)
+        st.configure("Big.TButton", font=(ui_font, 10, "bold"), padding=6)
 
         root = ttk.Frame(self.root, style="Card.TFrame", padding=(18, 14, 18, 14))
         root.pack(fill="both", expand=True)
@@ -387,6 +417,8 @@ class App:
 
     # ---------------- 配置 <-> 界面 ----------------
     def _apply_cfg_to_ui(self):
+        if self.root is None:          # 无界面模式没有这些变量
+            return
         self.var_acc.set(self.cfg.get("account", ""))
         self.var_pwd.set(self.cfg.get("password", ""))
         code = self.cfg.get("carrier", "mobile")
@@ -459,6 +491,11 @@ class App:
         self.worker.request_logout()
 
     def _init_tray(self):
+        # Linux 版不做托盘：开着自启时由 systemd 用户服务在后台跑，
+        # 想改设置就再运行一次程序（单实例会把它唤到前台）。
+        if sys.platform != "win32":
+            self.tray = None
+            return
         try:
             from trayicon import TrayIcon
             self.tray = TrayIcon(
@@ -534,8 +571,11 @@ class App:
                         variable=self.var_startwin).grid(row=len(rows), column=0,
                                                          columnspan=3, sticky="w", pady=(8, 0))
 
-        info = ("配置目录：%s\n配置文件里的密码只以密文存在 secret.bin，"
-                "由 Windows DPAPI 按当前用户加密。" % cfgtool.data_dir())
+        info = ("配置目录：%s\n"
+                "密码保存方式：%s\n"
+                "开机自启方式：%s"
+                % (cfgtool.data_dir(), cfgtool.secret_backend_name(),
+                   cfgtool.autostart_backend_name()))
         ttk.Label(f, text=info, style="Dim.TLabel", wraplength=400,
                   justify="left").grid(row=len(rows) + 1, column=0, columnspan=3,
                                        sticky="w", pady=(10, 0))
@@ -566,7 +606,8 @@ class App:
         btns = ttk.Frame(f, style="Card.TFrame")
         btns.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="打开配置目录",
-                   command=lambda: os.startfile(cfgtool.data_dir())).pack(side="left", padx=4)
+                   command=lambda: cfgtool.open_in_file_manager(
+                       cfgtool.data_dir())).pack(side="left", padx=4)
         ttk.Button(btns, text="保存", command=ok).pack(side="left", padx=4)
         ttk.Button(btns, text="取消", command=w.destroy).pack(side="left")
         w.update_idletasks()
@@ -608,6 +649,10 @@ class App:
 
     def _render_state(self, state, detail=""):
         text, color = STATE_STYLE.get(state, STATE_STYLE["idle"])
+        if self.root is None:
+            # 无界面模式：状态只写日志，别去碰不存在的控件
+            log("状态: %s%s" % (text, (" - " + detail) if detail else ""))
+            return
         try:
             self.lbl_state.configure(text=text, foreground=color)
             self.btn_conn.configure(
@@ -620,6 +665,9 @@ class App:
             self.set_msg(detail)
 
     def set_msg(self, text: str):
+        if self.root is None:
+            log(text)
+            return
         try:
             self.lbl_msg.configure(text=text[:200])
         except Exception:
@@ -655,7 +703,10 @@ class App:
             return
         self._closing = True
         try:
-            self._save_prefs()
+            if self.root is None:
+                cfgtool.save(self.cfg)      # 无界面：直接落盘，别碰界面变量
+            else:
+                self._save_prefs()
         except Exception:
             pass
         try:
@@ -668,45 +719,48 @@ class App:
         except Exception:
             pass
         try:
-            self.root.destroy()
+            if self.root is not None:
+                self.root.destroy()
         except Exception:
             pass
 
     def run(self):
+        if self.root is None:
+            # 无界面：主线程就守在事件循环上，直到收到退出信号。
+            # 网络线程是 daemon，这里 Ctrl+C / SIGTERM 都能干净退出。
+            try:
+                while not self._closing:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.quit()
+            return
         self.root.mainloop()
 
 
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
-def already_running() -> bool:
-    try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateMutexW(None, False, "Global\\CampusNetPortal_SingleInstance")
-        return kernel32.GetLastError() == 183       # ERROR_ALREADY_EXISTS
-    except Exception:
-        return False
-
-
 def main():
     args = [a.lower() for a in sys.argv[1:]]
     if "--version" in args or "-v" in args:
         print("%s v%s" % (APP_TITLE, VERSION))
         return
     silent = "--silent" in args
-    if already_running():
+    if not cfgtool.single_instance_lock():
         log("已有实例在运行，本次退出")
         return
 
     cfg = cfgtool.load()
     if as_bool(cfg.get("autostart", "0")):
-        # 修正注册表里的启动命令（换路径 / 换静默设置后仍能生效）
+        # 修正自启项里的启动命令（换路径 / 改静默设置后仍能生效）
         cfgtool.set_autostart(True, silent=as_bool(cfg.get("silent_start", "1")))
     if silent and not as_bool(cfg.get("silent_start", "1")):
         silent = False
 
     app = App(silent=silent)
-    log("启动 (silent=%s, v%s)" % (silent, VERSION))
+    log("启动 (silent=%s, v%s, %s)" % (silent, VERSION, sys.platform))
     app.run()
 
 

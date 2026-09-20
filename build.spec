@@ -16,11 +16,20 @@ EXCLUDES = [
     "curses", "sqlite3", "tkinter.test", "test",
 ]
 
+# 按平台带上对应图标：
+#   Windows -> net.ico（exe 图标 + 托盘）
+#   Linux   -> net.png（窗口图标 + .desktop 引用）
+DATAS = []
+if os.path.exists("net.ico"):
+    DATAS.append(("net.ico", "."))
+if os.path.exists("net.png"):
+    DATAS.append(("net.png", "."))
+
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("net.ico", ".")] if os.path.exists("net.ico") else [],
+    datas=DATAS,
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],

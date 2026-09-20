@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Windows 系统托盘图标（ctypes 直接调用 Win32，不引入 pystray / pywin32）。
 
+只在 Windows 上使用；Linux 版不做托盘（开机自启用 systemd 用户服务实现）。
+
 设计要点：
 * 托盘窗口消息循环跑在独立线程，UI 线程（Tk）完全不被阻塞；
 * 左键单击 / 双击 -> 打开主界面；右键 -> 弹出菜单；
@@ -11,10 +13,11 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import os
-import struct
 import sys
 import threading
-import zlib
+
+# 图标绘制放在 iconart 里，Windows 用 ICO，Linux 用 PNG，共用同一套图形
+from iconart import icon_pixels, make_ico, to_png   # noqa: F401
 
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
@@ -72,96 +75,8 @@ shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.c_void_p]
 
 
 # --------------------------------------------------------------------------- #
-# 图标：运行时用标准库生成 PNG / ICO，避免往仓库塞二进制
+# 图标绘制已移到 iconart.py（Windows 用 ICO，Linux 用 PNG，共用同一套图形）
 # --------------------------------------------------------------------------- #
-def _png(px) -> bytes:
-    """把 (r,g,b,a) 行列表编码成 PNG（标准库 zlib，不依赖 Pillow）。"""
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + tag + data +
-                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-    h = len(px)
-    w = len(px[0]) // 4
-    raw = b"".join(bytes([0]) + bytes(px[y]) for y in range(h))
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw, 9))
-            + chunk(b"IEND", b""))
-
-
-def _bmp_entry(px) -> bytes:
-    """ICO 里的 32bpp BMP 条目：BITMAPINFOHEADER(高度×2) + BGRA 倒序 + AND 掩码。"""
-    h = len(px)
-    w = len(px[0]) // 4
-    header = struct.pack("<IiiHHIIiiII", 40, w, h * 2, 1, 32, 0, 0, 0, 0, 0, 0)
-    xor = bytearray()
-    for y in range(h - 1, -1, -1):          # BMP 自下而上
-        row = px[y]
-        for x in range(w):
-            r, g, b, a = row[x * 4], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]
-            xor += bytes((b, g, r, a))
-    and_stride = ((w + 31) // 32) * 4
-    mask = b"\x00" * (and_stride * h)       # 32bpp 用 alpha，掩码全 0
-    return header + bytes(xor) + mask
-
-
-def make_ico(path: str) -> bool:
-    """生成多尺寸 ICO（16/24/32/48 用 BMP，256 用 PNG）。失败返回 False。"""
-    try:
-        sizes = (16, 24, 32, 48, 64, 256)
-        entries, blobs = [], []
-        for s in sizes:
-            px = _icon_pixels(s)
-            data = _png(px) if s >= 256 else _bmp_entry(px)
-            entries.append((s, data))
-            blobs.append(data)
-
-        header = struct.pack("<HHH", 0, 1, len(entries))
-        offset = 6 + 16 * len(entries)
-        dirs = bytearray()
-        for (s, data) in entries:
-            dim = 0 if s >= 256 else s
-            dirs += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32,
-                                len(data), offset)
-            offset += len(data)
-        with open(path, "wb") as f:
-            f.write(header + bytes(dirs) + b"".join(blobs))
-        return True
-    except Exception:
-        return False
-
-
-def _icon_pixels(size: int = 64):
-    """蓝色圆底 + 白色“网络/信号”图形。"""
-    cx = cy = (size - 1) / 2.0
-    r = size / 2.0 - 1
-    rows = []
-    for y in range(size):
-        row = bytearray()
-        for x in range(size):
-            dx, dy = x - cx, y - cy
-            d = (dx * dx + dy * dy) ** 0.5
-            if d > r:
-                row += b"\x00\x00\x00\x00"
-                continue
-            # 圆内：亮蓝 -> 深蓝 渐变，边缘 1.5px 抗锯齿
-            t = (y / max(size - 1, 1))
-            rr, gg, bb = int(0x2E + t * 0x0A), int(0x86 + t * 0x30), int(0xF0 + t * 0x0F)
-            a = 255
-            if d > r - 1.5:
-                a = int(255 * (r - d) / 1.5)
-            # 中部三条白色横杠，象征信号/网络
-            u = (x - 17) / 30.0
-            v = (y - 20) / 24.0
-            on_bar = False
-            for by, frac, thick in ((22, 0.95, 0.16), (32, 0.68, 0.16), (42, 0.40, 0.16)):
-                if abs(y - by) < size * thick / 2 and 0 < u < frac:
-                    on_bar = True
-            if on_bar and 0 <= v <= 1:
-                rr = gg = bb = 0xFF
-            row += bytes((rr, gg, bb, max(0, min(255, a))))
-        rows.append(row)
-    return rows
 
 
 # --------------------------------------------------------------------------- #

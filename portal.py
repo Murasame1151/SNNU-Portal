@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import time
 
 import requests
@@ -316,118 +317,25 @@ class PortalClient:
 
 # --------------------------------------------------------------------------- #
 # 本机网卡流量统计（判断“是否真的长时间没流量”，只读，几乎零开销）
+#
+# 实现按平台放在 plat/ 下：
+#   Windows -> GetIfTable2（按 IF_HARDWARE 位只取物理网卡）
+#   Linux   -> /proc/net/dev（跳过 lo / docker / veth 等虚拟接口）
+# 这里只做转发，方便测试时替换。
 # --------------------------------------------------------------------------- #
-import ctypes  # noqa: E402
-
-
-class _MIB_IF_ROW2(ctypes.Structure):
-    """与 Windows MIB_IF_ROW2 严格对齐（sizeof = 1352，64 位）。
-
-    字段偏移必须和系统一致：多一个字节都会让 Table[i] 的步长错位，
-    读出来的计数器就是垃圾数据（表现为“流量永远是 0”）。
-    """
-    _fields_ = [
-        ("InterfaceLuid", ctypes.c_uint64),          # 0
-        ("InterfaceIndex", ctypes.c_uint32),         # 8
-        ("InterfaceGuid", ctypes.c_byte * 16),       # 12
-        ("Alias", ctypes.c_wchar * 257),             # 28
-        ("Description", ctypes.c_wchar * 257),       # 542
-        ("PhysicalAddressLength", ctypes.c_uint32),  # 1056
-        ("PhysicalAddress", ctypes.c_byte * 32),     # 1060
-        ("PermanentPhysicalAddress", ctypes.c_byte * 32),  # 1092
-        ("Mtu", ctypes.c_uint32),                    # 1124
-        ("Type", ctypes.c_uint32),                   # 1128
-        ("TunnelType", ctypes.c_uint32),             # 1132
-        ("MediaType", ctypes.c_uint32),              # 1136
-        ("PhysicalMediumType", ctypes.c_uint32),     # 1140
-        ("AccessType", ctypes.c_uint32),             # 1144
-        ("DirectionType", ctypes.c_uint32),          # 1148
-        ("InterfaceAndOperStatusFlags", ctypes.c_byte),  # 1152
-        ("_pad1", ctypes.c_byte * 3),                # 1153
-        ("OperStatus", ctypes.c_uint32),             # 1156
-        ("AdminStatus", ctypes.c_uint32),            # 1160
-        ("MediaConnectState", ctypes.c_uint32),      # 1164
-        ("NetworkGuid", ctypes.c_byte * 16),         # 1168
-        ("ConnectionType", ctypes.c_uint32),         # 1184
-        ("_pad2", ctypes.c_uint32),                  # 1188
-        ("TransmitLinkSpeed", ctypes.c_uint64),      # 1192
-        ("ReceiveLinkSpeed", ctypes.c_uint64),       # 1200
-        ("InOctets", ctypes.c_uint64),               # 1208
-        ("InUcastPkts", ctypes.c_uint64),            # 1216
-        ("InNUcastPkts", ctypes.c_uint64),           # 1224
-        ("InDiscards", ctypes.c_uint64),             # 1232
-        ("InErrors", ctypes.c_uint64),               # 1240
-        ("InUnknownProtos", ctypes.c_uint64),        # 1248
-        ("InUcastOctets", ctypes.c_uint64),          # 1256
-        ("InMulticastOctets", ctypes.c_uint64),      # 1264
-        ("InBroadcastOctets", ctypes.c_uint64),      # 1272
-        ("OutOctets", ctypes.c_uint64),              # 1280
-        ("OutUcastPkts", ctypes.c_uint64),           # 1288
-        ("OutNUcastPkts", ctypes.c_uint64),          # 1296
-        ("OutDiscards", ctypes.c_uint64),            # 1304
-        ("OutErrors", ctypes.c_uint64),              # 1312
-        ("OutUcastOctets", ctypes.c_uint64),         # 1320
-        ("OutMulticastOctets", ctypes.c_uint64),     # 1328
-        ("OutBroadcastOctets", ctypes.c_uint64),     # 1336
-        ("OutQLen", ctypes.c_uint64),                # 1344
-    ]                                                # 合计 1352
-
-
-class _MIB_IF_TABLE2(ctypes.Structure):
-    _fields_ = [("NumEntries", ctypes.c_uint32),
-                ("_pad", ctypes.c_uint32),
-                ("Table", _MIB_IF_ROW2 * 1)]
-
-
-_MIB_IF_ROW2_SIZE = ctypes.sizeof(_MIB_IF_ROW2)
-_TABLE_OFFSET = 8  # NumEntries(4) + 4 字节对齐填充，之后就是 Table[0]
-
-# InterfaceAndOperStatusFlags 的位定义（MSDN）
-_IF_HARDWARE = 0x01        # 真实网卡
-_IF_FILTER = 0x04          # NDIS 轻量筛选器（与真实网卡共用同一组计数，必须排除）
-_IF_TYPE_ETHERNET = 6
-_IF_TYPE_WIFI = 71
-_get_if_table2 = getattr(ctypes.windll.iphlpapi, "GetIfTable2", None) \
-    if hasattr(ctypes, "windll") else None
-_free_mib_table = getattr(ctypes.windll.iphlpapi, "FreeMibTable", None) \
-    if hasattr(ctypes, "windll") else None
+if sys.platform == "win32":
+    import plat.win_impl as _netimpl
+else:
+    import plat.lin_impl as _netimpl
 
 
 def net_bytes() -> int:
-    """返回本机所有物理网卡累计收发的字节数；读取失败返回 -1。
+    """返回本机物理网卡累计收发的字节数；读取失败返回 -1。
 
     用来判断“最近是否真的没有网络流量”——有流量就不必补流量，
     从而把保活开销降到接近 0。
     """
-    if _get_if_table2 is None:
-        return -1
-    ptr = ctypes.c_void_p()
     try:
-        if _get_if_table2(ctypes.byref(ptr)) != 0 or not ptr:
-            return -1
-        num = ctypes.c_uint32.from_address(ptr.value).value
-        base = ptr.value + _TABLE_OFFSET
-        total = 0
-        counted = 0
-        fallback = 0
-        for i in range(num):
-            row = _MIB_IF_ROW2.from_address(base + i * _MIB_IF_ROW2_SIZE)
-            if row.Type not in (_IF_TYPE_ETHERNET, _IF_TYPE_WIFI) or row.OperStatus != 1:
-                continue
-            flags = ctypes.c_ubyte(row.InterfaceAndOperStatusFlags).value
-            octets = row.InOctets + row.OutOctets
-            if flags & _IF_HARDWARE and not flags & _IF_FILTER:
-                # 真实网卡：只用它，避免筛选器/虚拟网卡重复计数
-                total += octets
-                counted += 1
-            fallback = max(fallback, octets)
-        # flags 布局万一变了，就退回“取流量最大的那块网卡”
-        return total if counted else (fallback if fallback else 0)
+        return _netimpl.net_bytes()
     except Exception:
         return -1
-    finally:
-        if ptr and _free_mib_table is not None:
-            try:
-                _free_mib_table(ptr)
-            except Exception:
-                pass

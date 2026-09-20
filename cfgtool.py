@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""配置读写 + Windows DPAPI 加解密（仅依赖标准库 ctypes）。
+"""配置读写 + 密码保存 + 开机自启（跨平台，Windows / Linux 都可用）。
 
-配置目录: %APPDATA%\\CampusNetPortal
+平台相关的部分都交给 plat/ 下的实现模块：
+    Windows -> plat/win_impl.py（DPAPI + 注册表 + GetIfTable2）
+    Linux   -> plat/lin_impl.py（keyring/0600 文件 + systemd 用户服务 + /proc/net/dev）
+
+配置目录:
+    Windows  %APPDATA%\\CampusNetPortal
+    Linux    ~/.config/CampusNetPortal（遵循 XDG_CONFIG_HOME）
+里面只放三样东西：
     config.ini    明文配置（不含密码）
-    secret.bin    DPAPI 加密后的密码（绑定当前 Windows 用户）
+    secret.bin    密码（Windows 为 DPAPI 密文；Linux 为 keyring 或 0600 文件）
     app.log       运行日志
 """
 from __future__ import annotations
 
 import base64
 import configparser
-import ctypes
-import ctypes.wintypes as wt
 import os
 import sys
 import time
@@ -35,10 +40,19 @@ DEFAULTS = {
 # --------------------------------------------------------------------------- #
 # 路径
 # --------------------------------------------------------------------------- #
+def _default_dir() -> str:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, APP_NAME)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_NAME)
+
+
 def data_dir() -> str:
     """配置目录。
 
-    默认 %APPDATA%\\CampusNetPortal。
+    Windows 默认 %APPDATA%\\CampusNetPortal；
+    Linux   默认 ~/.config/CampusNetPortal（目录权限 0700）。
     设置环境变量 CAMPUSNET_DATA_DIR 可改写（自检脚本用它做隔离，避免
     测试数据混进真实配置；打包后的程序不会用到）。
     """
@@ -50,10 +64,11 @@ def data_dir() -> str:
         except OSError:
             pass
         return d
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, APP_NAME)
+    d = _default_dir()
     try:
         os.makedirs(d, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(d, 0o700)          # 只有本人能进这个目录
     except OSError:
         d = os.path.dirname(os.path.abspath(sys.argv[0]))
     return d
@@ -84,25 +99,23 @@ def log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# DPAPI（当前用户作用域）
+# 平台相关实现的分发
+#
+# 密码状态检查不需要特别处理：Windows 交给 DPAPI，Linux 交给 keyring 或
+# 0600 混淆文件，两边都由各自的 impl 模块负责。
 # --------------------------------------------------------------------------- #
-class _BLOB(ctypes.Structure):
-    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+if sys.platform == "win32":
+    import plat.win_impl as _impl
+    IS_WINDOWS = True
+    _impl_name = "win_impl"
+else:
+    import plat.lin_impl as _impl
+    IS_WINDOWS = False
+    _impl_name = "lin_impl"
 
-
-def _crypt(protect: bool, raw: bytes) -> bytes:
-    buf = ctypes.create_string_buffer(raw, len(raw))
-    blob_in = _BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = _BLOB()
-    fn = ctypes.windll.crypt32.CryptProtectData if protect else \
-        ctypes.windll.crypt32.CryptUnprotectData
-    args = (ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
-    if not fn(*args):
-        raise OSError("DPAPI call failed")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+# 兼容旧名字：win_impl 里的常量
+RUN_KEY = getattr(_impl, "RUN_KEY", "")
+RUN_NAME = getattr(_impl, "RUN_NAME", "campus-net-portal")
 
 
 def _secret_path() -> str:
@@ -110,16 +123,29 @@ def _secret_path() -> str:
 
 
 def save_password(pwd: str) -> None:
-    data = _crypt(True, pwd.encode("utf-8"))
+    data = _impl.protect(pwd)
+    if IS_WINDOWS:
+        # Windows 的 DPAPI 密文用 base64 存，避免二进制脏数据
+        data = base64.b64encode(data)
     with open(_secret_path(), "wb") as f:
-        f.write(base64.b64encode(data))
+        f.write(data)
+    if not IS_WINDOWS:
+        try:
+            os.chmod(_secret_path(), 0o600)          # 只有本人可读
+        except OSError:
+            pass
 
 
 def load_password() -> str:
     try:
         with open(_secret_path(), "rb") as f:
-            data = base64.b64decode(f.read())
-        return _crypt(False, data).decode("utf-8")
+            data = f.read()
+    except OSError:
+        return ""
+    try:
+        if IS_WINDOWS:
+            data = base64.b64decode(data)
+        return _impl.unprotect(data)
     except Exception:
         return ""
 
@@ -129,6 +155,53 @@ def clear_password() -> None:
         os.remove(_secret_path())
     except OSError:
         pass
+
+
+def secret_backend_name() -> str:
+    """给设置界面显示：密码到底存在哪、怎么保护的。"""
+    try:
+        return _impl.secret_backend_name()
+    except Exception:
+        return "未知"
+
+
+def autostart_backend_name() -> str:
+    try:
+        return _impl.autostart_backend_name()
+    except Exception:
+        return "未知"
+
+
+def single_instance_lock() -> bool:
+    """单实例保护。Windows 用命名互斥量，Linux 用 PID 文件 flock。"""
+    try:
+        if IS_WINDOWS:
+            return _impl.single_instance_lock(
+                "Global\\CampusNetPortal_SingleInstance")
+        return _impl.single_instance_lock(os.path.join(data_dir(), "app.lock"))
+    except Exception:
+        return True
+
+
+def open_in_file_manager(path: str) -> bool:
+    try:
+        return _impl.open_in_file_manager(path)
+    except Exception:
+        return False
+
+
+def headless_reason():
+    """判断是不是没有图形界面的环境（纯 SSH / systemd 开机自启时）。
+
+    返回 None 表示有图形界面；返回字符串表示原因（用于写日志）。
+    Linux 下没有 DISPLAY 也没有 WAYLAND_DISPLAY 就没法建 Tk 窗口；
+    Windows 上桌面总是可用的。
+    """
+    if IS_WINDOWS:
+        return None
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return None
+    return "没有 DISPLAY / WAYLAND_DISPLAY 环境变量"
 
 
 # --------------------------------------------------------------------------- #
@@ -168,66 +241,33 @@ def as_bool(v) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 开机自启（当前用户注册表，不需要管理员权限）
+# 开机自启（Windows: HKCU 注册表；Linux: systemd 用户服务）
 # --------------------------------------------------------------------------- #
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "CampusNetPortal"
-
-_adv = ctypes.windll.advapi32
-_HKEY = ctypes.c_void_p          # 64 位下句柄必须按指针声明，否则会被截断
-_HKEY_CURRENT_USER = ctypes.c_void_p(0x80000001)
-_REG_SZ = 1
-
-# 显式声明 argtypes：不声明的话 ctypes 会把 64 位句柄当 32 位 int 传，注册表操作必然失败
-_adv.RegOpenKeyExW.argtypes = [_HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD,
-                               ctypes.POINTER(_HKEY)]
-_adv.RegSetValueExW.argtypes = [_HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD,
-                                ctypes.c_void_p, wt.DWORD]
-_adv.RegDeleteValueW.argtypes = [_HKEY, wt.LPCWSTR]
-_adv.RegQueryValueExW.argtypes = [_HKEY, wt.LPCWSTR, ctypes.POINTER(wt.DWORD),
-                                  ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
-                                  ctypes.POINTER(wt.DWORD)]
-_adv.RegCloseKey.argtypes = [_HKEY]
-_adv.RegQueryValueExW.restype = ctypes.c_long
-_adv.RegSetValueExW.restype = ctypes.c_long
-_adv.RegDeleteValueW.restype = ctypes.c_long
-_adv.RegOpenKeyExW.restype = ctypes.c_long
-
-# 只申请读/写值所需的权限，不要 KEY_ALL_ACCESS（Run 键上会因权限过大被拒）
-_KEY_QUERY_VALUE = 0x0001
-_KEY_SET_VALUE = 0x0002
-
-
 def exe_command(silent: bool) -> str:
+    """拼出开机要执行的命令（含 --silent）。
+
+    Windows 用双引号包路径（反斜杠路径必须加引号）。
+    Linux 下用 shlex.quote，避免路径里有空格/特殊字符时被拆开。
+    """
     if getattr(sys, "frozen", False):
         exe = sys.executable
         args = " --silent" if silent else ""
-    else:
-        py = sys.executable
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
-        exe = sys.executable
-        args = ' "%s"%s' % (script, " --silent" if silent else "")
-    return '"%s"%s' % (exe, args)
+        if IS_WINDOWS:
+            return '"%s"%s' % (exe, args)
+        import shlex
+        return shlex.quote(exe) + args
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+    if IS_WINDOWS:
+        return '"%s" "%s"%s' % (sys.executable, script,
+                                " --silent" if silent else "")
+    import shlex
+    return "%s %s%s" % (shlex.quote(sys.executable), shlex.quote(script),
+                        " --silent" if silent else "")
 
 
 def set_autostart(enable: bool, silent: bool = True) -> bool:
     try:
-        hkey = _HKEY()
-        if _adv.RegOpenKeyExW(_HKEY_CURRENT_USER, RUN_KEY, 0,
-                              _KEY_QUERY_VALUE | _KEY_SET_VALUE,
-                              ctypes.byref(hkey)) != 0:
-            return False
-        try:
-            if enable:
-                cmd = exe_command(silent)
-                rc = _adv.RegSetValueExW(hkey, RUN_NAME, 0, _REG_SZ,
-                                         ctypes.c_wchar_p(cmd),
-                                         (len(cmd) + 1) * ctypes.sizeof(ctypes.c_wchar))
-                return rc == 0
-            # 关闭：删掉整条键，不存在也算成功
-            return _adv.RegDeleteValueW(hkey, RUN_NAME) in (0, 2)
-        finally:
-            _adv.RegCloseKey(hkey)
+        return _impl.set_autostart(enable, silent, exe_command(silent))
     except Exception as e:
         log("设置自启失败: %r" % (e,))
         return False
@@ -235,13 +275,6 @@ def set_autostart(enable: bool, silent: bool = True) -> bool:
 
 def get_autostart() -> bool:
     try:
-        hkey = _HKEY()
-        if _adv.RegOpenKeyExW(_HKEY_CURRENT_USER, RUN_KEY, 0, _KEY_QUERY_VALUE,
-                              ctypes.byref(hkey)) != 0:
-            return False
-        try:
-            return _adv.RegQueryValueExW(hkey, RUN_NAME, None, None, None, None) == 0
-        finally:
-            _adv.RegCloseKey(hkey)
+        return _impl.get_autostart()
     except Exception:
         return False

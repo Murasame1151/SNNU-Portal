@@ -1,5 +1,31 @@
 # 更新日志
 
+## [2.1.0] — 2026-09-18
+
+**新增 Linux（Debian / Ubuntu）支持。**
+
+* 平台相关代码拆到 `plat/` 下按平台分发，Windows 行为完全不变：
+
+  | 能力 | Windows | Linux |
+  | --- | --- | --- |
+  | 密码保存 | DPAPI（当前用户） | 系统 keyring；无 keyring 时退化为 0600 混淆文件 |
+  | 开机自启 | `HKCU\...\Run` 注册表 | systemd 用户服务（无需 root） |
+  | 流量统计 | `GetIfTable2` | `/proc/net/dev` |
+  | 单实例 | 命名互斥量 | PID 文件 + `flock` |
+  | 托盘图标 | 有 | 无（Linux 用 systemd 更自然） |
+  | 图标 | 多尺寸 ICO | 256px PNG |
+
+* **新增无界面（headless）模式**：在没有 `DISPLAY`/`WAYLAND_DISPLAY` 的环境
+  （纯 SSH、systemd 开机自启）下自动转入后台认证模式，只跑认证与保活，
+  不再因为 `tk.Tk()` 抛 `TclError` 而崩溃。这是构建时实测发现的真实缺陷。
+* 新增 `build_linux.sh`（PyInstaller 单文件）、`build_zipapp.sh`
+  （几十 KB 的 .pyz，只需系统有 python3）、`install_linux.sh`（含卸载）。
+* 图标绘制抽到 `iconart.py`，顺带修掉一个尺寸问题：原来的三条横杠用的是
+  写死的 64px 坐标，生成 16px / 256px 图标时图案会错位，现在改成按比例绘制。
+* 自检脚本 `logictest.py` 改为跨平台：Windows 走注册表 / DPAPI 断言，
+  Linux 走 systemd / 0600 / `/proc/net/dev` 解析断言（含合成数据测试）。
+* Linux 界面字体、ttk 主题、窗口图标都做了平台分支（Linux 没有雅黑和 vista 主题）。
+
 ## [2.0.0] — 2026-09-17
 
 第一个正式版本。把 v1.0 那个“改代码 → 运行 → 打印一个状态码”的手动脚本，

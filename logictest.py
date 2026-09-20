@@ -9,6 +9,7 @@
 import ctypes
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -174,56 +175,127 @@ check("keepalive 成功", client.keepalive() is True)
 # --------------------------------------------------------------------------- #
 b1 = portal.net_bytes()
 check("net_bytes 可读", b1 >= 0, str(b1))
-check("MIB_IF_ROW2 结构体尺寸正确", portal._MIB_IF_ROW2_SIZE == 1352,
-      str(portal._MIB_IF_ROW2_SIZE))
-check("InOctets 偏移正确", portal._MIB_IF_ROW2.InOctets.offset == 1208)
+
+if sys.platform == "win32":
+    import plat.win_impl as netimpl
+    check("MIB_IF_ROW2 结构体尺寸正确", netimpl._MIB_IF_ROW2_SIZE == 1352,
+          str(netimpl._MIB_IF_ROW2_SIZE))
+    check("InOctets 偏移正确", netimpl._MIB_IF_ROW2.InOctets.offset == 1208)
+else:
+    # Linux：用一份合成的 /proc/net/dev 验证解析与虚拟接口过滤
+    import unittest.mock as mock
+
+    import plat.lin_impl as netimpl
+    check("物理接口识别", netimpl._is_physical("eth0")
+          and netimpl._is_physical("wlan0"))
+    check("虚拟接口被排除", not any(netimpl._is_physical(x) for x in
+                                    ("lo", "docker0", "veth123", "br-abc")))
+
+    fake_dev = (
+        "Inter-|   Receive                                                "
+        "|  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast"
+        "|bytes    packets\n"
+        "    lo: 1000000    1000    0    0    0     0          0         0"
+        "  1000000    1000\n"
+        "docker0:  999999     999    0    0    0     0          0         0"
+        "   999999     999\n"
+        "  eth0:    5000      50    0    0    0     0          0         0"
+        "     7000      70\n"
+        " wlan0:    3000      30    0    0    0     0          0         0"
+        "     4000      40\n"
+    )
+    with mock.patch("builtins.open", mock.mock_open(read_data=fake_dev)):
+        got = netimpl.net_bytes()
+    # 只应统计 eth0(5000+7000) 与 wlan0(3000+4000) = 19000
+    check("Linux 流量统计只算物理网卡", got == 19000, "得到 %s" % got)
 
 # --------------------------------------------------------------------------- #
-# 注册表开机自启
+# 密码保存后端
 # --------------------------------------------------------------------------- #
-import winreg       # noqa: E402
+if sys.platform != "win32":
+    cfgtool.save_password("linux-roundtrip-中文")
+    check("Linux 密码可往返", cfgtool.load_password() == "linux-roundtrip-中文",
+          cfgtool.secret_backend_name())
+    if not cfgtool.secret_backend_name().startswith("系统 keyring"):
+        mode = stat.S_IMODE(os.stat(cfgtool._secret_path()).st_mode)
+        check("secret.bin 权限为 0600", mode == 0o600, oct(mode))
 
+# --------------------------------------------------------------------------- #
+# 开机自启：Windows 查注册表，Linux 查 systemd 用户服务
+# --------------------------------------------------------------------------- #
+if sys.platform == "win32":
+    import winreg       # noqa: E402
 
-def read_run_value():
-    """读当前 Run 项的值，不存在返回 None（用于测试后还原现场）。"""
+    def read_run_value():
+        """读当前 Run 项的值，不存在返回 None（用于测试后还原现场）。"""
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, cfgtool.RUN_KEY)
+        except OSError:
+            return None
+        try:
+            return winreg.QueryValueEx(k, cfgtool.RUN_NAME)[0]
+        except OSError:
+            return None
+        finally:
+            winreg.CloseKey(k)
+
+    original = read_run_value()
     try:
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, cfgtool.RUN_KEY)
-    except OSError:
-        return None
-    try:
-        return winreg.QueryValueEx(k, cfgtool.RUN_NAME)[0]
-    except OSError:
-        return None
+        check("开启自启成功", cfgtool.set_autostart(True, silent=True)
+              and cfgtool.get_autostart())
+        check("启动命令带 --silent",
+              "--silent" in (read_run_value() or ""), read_run_value() or "")
+        check("关闭自启成功", cfgtool.set_autostart(False)
+              and not cfgtool.get_autostart())
     finally:
-        winreg.CloseKey(k)
+        # 还原测试前的状态：原来有就写回原值，原来没有就保持删除
+        if original is not None:
+            cfgtool.set_autostart(True, silent=False)
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, cfgtool.RUN_KEY, 0,
+                                 winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, cfgtool.RUN_NAME, 0, winreg.REG_SZ, original)
+            winreg.CloseKey(key)
+        else:
+            cfgtool.set_autostart(False)
+    check("自启状态已还原到测试前", read_run_value() == original,
+          repr(original)[:60])
 
-
-original = read_run_value()
-try:
-    check("开启自启成功", cfgtool.set_autostart(True, silent=True)
-          and cfgtool.get_autostart())
-    check("启动命令带 --silent",
-          "--silent" in (read_run_value() or ""), read_run_value() or "")
-    check("关闭自启成功", cfgtool.set_autostart(False) and not cfgtool.get_autostart())
-finally:
-    # 还原测试前的状态：原来有就写回原值，原来没有就保持删除
-    if original is not None:
-        cfgtool.set_autostart(True, silent=False)
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, cfgtool.RUN_KEY, 0,
-                             winreg.KEY_SET_VALUE)
-        winreg.SetValueEx(key, cfgtool.RUN_NAME, 0, winreg.REG_SZ, original)
-        winreg.CloseKey(key)
-    else:
+    # 单实例：Windows 用命名互斥量
+    ctypes.windll.kernel32.CreateMutexW(
+        None, False, "Global\\CampusNetPortal_SingleInstance")
+    ctypes.windll.kernel32.CreateMutexW(
+        None, False, "Global\\CampusNetPortal_SingleInstance")
+    check("单实例互斥量生效", ctypes.windll.kernel32.GetLastError() == 183)
+else:
+    # Linux：自启写 systemd 用户服务，单实例用 flock
+    import plat.lin_impl as lin
+    unit = lin._unit_path()
+    existed = os.path.exists(unit)
+    original_unit = open(unit, encoding="utf-8").read() if existed else None
+    try:
+        cfgtool.set_autostart(True, silent=True)
+        check("写入 systemd 服务文件", os.path.exists(unit), unit)
+        body = open(unit, encoding="utf-8").read()
+        check("服务含 --silent", "--silent" in body)
+        check("服务含 WantedBy=default.target",
+              "WantedBy=default.target" in body)
         cfgtool.set_autostart(False)
-check("自启状态已还原到测试前", read_run_value() == original,
-      repr(original)[:60])
+        check("关闭后服务文件被删除", not os.path.exists(unit))
+    finally:
+        if original_unit is not None:
+            os.makedirs(os.path.dirname(unit), exist_ok=True)
+            with open(unit, "w", encoding="utf-8") as f:
+                f.write(original_unit)
+        elif os.path.exists(unit):
+            os.remove(unit)
+    check("自启现场已还原", os.path.exists(unit) == existed)
 
-# --------------------------------------------------------------------------- #
-# 单实例
-# --------------------------------------------------------------------------- #
-ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\CampusNetPortal_SingleInstance")
-ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\CampusNetPortal_SingleInstance")
-check("单实例互斥量生效", ctypes.windll.kernel32.GetLastError() == 183)
+    lockpath = os.path.join(TEST_DIR, "lock.test")
+    check("首次加锁成功", lin.single_instance_lock(lockpath) is True)
+    check("再次加锁被拒绝", lin.single_instance_lock(lockpath) is False)
+    check("密码后端名称可读", bool(cfgtool.secret_backend_name()),
+          cfgtool.secret_backend_name())
 
 portal._SESSION = REAL
 shutil.rmtree(TEST_DIR, ignore_errors=True)

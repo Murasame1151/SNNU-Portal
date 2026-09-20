@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=校园网自动认证
+Name[en]=SNNU Campus Net Portal
+Comment=陕西师范大学校园网自动认证（图形界面 / 开机自启 / 防掉线保活）
+Exec=校园网自动认证
+Icon=net
+Terminal=false
+Categories=Network;Utility;
+Keywords=campus;network;portal;snnu;
