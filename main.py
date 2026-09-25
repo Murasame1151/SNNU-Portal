@@ -27,7 +27,7 @@ import portal
 from cfgtool import as_bool, log
 
 APP_TITLE = "校园网自动认证"
-VERSION = "2.1"
+VERSION = "2.2.0"
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -45,6 +45,9 @@ class NetWorker:
         self._wake = threading.Event()
         self._force_login = False
         self._force_logout = False
+        self._manual_off = False              # 用户手动断开：不自动重连
+        self._allow_login_on_start = False    # 启动时是否自动认证
+        self._daily_done = None               # 今天已执行过的定时重连日期
         self.client = None
         self._thread = None
         self.status = "idle"                  # idle / connecting / online / offline
@@ -71,9 +74,15 @@ class NetWorker:
         with self._lock:
             self._force_login = True
             self._force_logout = logout_first
+            self._manual_off = False          # 手动连接 -> 恢复正常自动重连
+            self.cfg["want_online"] = "1"      # 记住“用户想在线”
         self._wake.set()
 
     def request_logout(self):
+        with self._lock:
+            self._manual_off = True           # 手动断开 -> 不再自动重连
+            self._force_login = False
+            self.cfg["want_online"] = "0"      # 重启后也不要自动连
         threading.Thread(target=self._logout_now, daemon=True).start()
 
     # ---------------- 内部 ----------------
@@ -97,8 +106,8 @@ class NetWorker:
     def _logout_now(self):
         c = self._client()
         c.logout()
-        self._log("已断开连接")
-        self._state("idle", "")
+        self._log("已手动断开，本次不再自动重连")
+        self._state("idle", "已手动断开")
 
     def _do_login(self) -> bool:
         self._state("connecting", "正在认证…")
@@ -112,6 +121,20 @@ class NetWorker:
             self._state("offline", c.last_message or "认证失败")
         return ok
 
+    def _reconnect_now(self, reason: str):
+        """强制重新认证一次（定时任务 / 睡眠唤醒后调用）。
+
+        先注销再登录，确保拿到的是**全新会话**——这两类场景的目的就是"重连"，
+        复用旧会话没有意义。
+        """
+        with self._lock:
+            self._force_login = True
+            self._force_logout = True
+            self._manual_off = False
+            self.cfg["want_online"] = "1"
+        self._log(reason)
+        self._wake.set()
+
     # ---------------- 网络线程回调 ----------------
     def _stop_check(self) -> bool:
         """网络线程在探活/保活途中调用：用户手动操作或程序要退出时立刻让路。"""
@@ -120,21 +143,60 @@ class NetWorker:
         with self._lock:
             return self._force_login
 
+    @staticmethod
+    def _parse_daily(text: str):
+        """解析 "HH:MM"；留空或格式不对返回 None（表示不启用）。"""
+        text = (text or "").strip()
+        if not text or ":" not in text:
+            return None
+        hh, _, mm = text.partition(":")
+        try:
+            h, m = int(hh), int(mm)
+        except ValueError:
+            return None
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return (h, m)
+        return None
+
     def _run(self):
         backoff = 5
         last_portal_check = 0.0
         last_traffic = time.time()
         last_bytes = portal.net_bytes()
         fail_count = 0
+        last_tick = time.time()
+        self._daily_done = None
 
         while not self._stop.is_set():
             try:
+                now_wall = time.time()
+                slept = now_wall - last_tick
+                last_tick = now_wall
+
                 with self._lock:
                     cfg = dict(self.cfg)
                     force_login = self._force_login
                     force_logout = self._force_logout
                     self._force_login = False
                     self._force_logout = False
+                    manual_off = self._manual_off
+
+                # ---- 睡眠唤醒检测：主循环每 5 秒一轮，跳变超过阈值说明系统睡过 ----
+                if slept > 120 and as_bool(cfg.get("wake_reconnect", "1")):
+                    self._reconnect_now("检测到系统从睡眠中唤醒（时间跳变 %d 秒），立即重连"
+                                        % int(slept))
+                    continue
+
+                # ---- 定时重连（每天一次）----
+                daily = self._parse_daily(cfg.get("daily_reconnect", ""))
+                if daily is not None:
+                    today = time.strftime("%Y-%m-%d")
+                    hhmm = time.strftime("%H:%M")
+                    if hhmm == "%02d:%02d" % daily:
+                        if self._daily_done != today:
+                            self._daily_done = today
+                            self._reconnect_now("到达定时重连时间 %s，开始重连" % hhmm)
+                            continue
 
                 if force_login:
                     if not cfg.get("account"):
@@ -159,8 +221,21 @@ class NetWorker:
                     self._wake.clear()
                     continue
 
+                if manual_off:
+                    # 用户手动断开后什么都不做，等手动连接 / 定时任务 / 唤醒事件
+                    self._wake.wait(5.0)
+                    self._wake.clear()
+                    continue
+
+                # 冷启动时不自动连：只有用户明确希望在线（want_online=1）才连，
+                # 手动断开后置 0，重启程序也不会自己连上。
+                if self.status == "idle" and not as_bool(cfg.get("want_online", "1")):
+                    self._wake.wait(5.0)
+                    self._wake.clear()
+                    continue
+
                 if self.status != "online":
-                    # 启动或掉线后重新认证
+                    # 启动（want_online=1）或掉线后重新认证
                     if self._do_login():
                         backoff = 5
                         fail_count = 0
@@ -175,7 +250,7 @@ class NetWorker:
                 else:
                     now = time.time()
                     # ---- 1. 问 portal“我现在是谁”：最可靠的在线判据，顺便续会话 ----
-                    if now - last_portal_check >= max(20, int(cfg.get("check_sec", 45))):
+                    if now - last_portal_check >= max(5, int(cfg.get("check_sec", 45))):
                         last_portal_check = now
                         if not self._client().portal_status(should_stop=self._stop_check):
                             self._log("portal 显示已掉线，开始重新认证")
@@ -485,10 +560,16 @@ class App:
             return
         self.set_msg("正在认证…")
         self.worker.request_login(logout_first=True)
+        # 落盘，让“希望在线”这个意图重启后仍然有效
+        self.cfg["want_online"] = "1"
+        cfgtool.save(self.cfg)
 
     def on_disconnect(self):
         self.set_msg("正在断开…")
         self.worker.request_logout()
+        # 手动断开后不再自动重连，重启也不自动连
+        self.cfg["want_online"] = "0"
+        cfgtool.save(self.cfg)
 
     def _init_tray(self):
         # Linux 版不做托盘：开着自启时由 systemd 用户服务在后台跑，
@@ -554,7 +635,7 @@ class App:
 
         rows = [
             ("探活周期（秒）", "check_sec",
-             "每隔多久检查一次网络是否还通，建议 45，最小 30"),
+             "每隔多久检查一次网络是否还通，建议 45，最小 5"),
             ("空闲阈值（秒）", "idle_sec",
              "本机连续多少秒没有流量后才补发保活流量，避免多余流量"),
             ("保活周期（秒）", "traffic_sec",
@@ -566,10 +647,29 @@ class App:
             ttk.Label(f, text=tip, style="Dim.TLabel", wraplength=260,
                       justify="left").grid(row=i, column=2, sticky="w")
 
+        # ---- 定时重连 ----
+        row_daily = len(rows)
+        self.var_daily = tk.StringVar(value=str(self.cfg.get("daily_reconnect", "")))
+        ttk.Label(f, text="定时重连（HH:MM）", style="Card.TLabel").grid(
+            row=row_daily, column=0, sticky="w", pady=4)
+        ttk.Entry(f, textvariable=self.var_daily, width=8).grid(
+            row=row_daily, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="每天到这个时刻重新认证一次，例如 02:00；留空则不启用",
+                  style="Dim.TLabel", wraplength=260,
+                  justify="left").grid(row=row_daily, column=2, sticky="w")
+
+        # ---- 唤醒后重连 ----
+        row_wake = row_daily + 1
+        self.var_wake = tk.BooleanVar(
+            value=as_bool(self.cfg.get("wake_reconnect", "1")))
+        ttk.Checkbutton(f, text="睡眠唤醒后立即重连",
+                        variable=self.var_wake).grid(row=row_wake, column=0,
+                                                     columnspan=3, sticky="w", pady=(6, 0))
+
         self.var_startwin = tk.BooleanVar(value=not as_bool(self.cfg.get("silent_start", "1")))
         ttk.Checkbutton(f, text="开机自启时显示主窗口（不勾选＝静默后台运行）",
-                        variable=self.var_startwin).grid(row=len(rows), column=0,
-                                                         columnspan=3, sticky="w", pady=(8, 0))
+                        variable=self.var_startwin).grid(row=row_wake + 1, column=0,
+                                                         columnspan=3, sticky="w", pady=(4, 0))
 
         info = ("配置目录：%s\n"
                 "密码保存方式：%s\n"
@@ -577,15 +677,22 @@ class App:
                 % (cfgtool.data_dir(), cfgtool.secret_backend_name(),
                    cfgtool.autostart_backend_name()))
         ttk.Label(f, text=info, style="Dim.TLabel", wraplength=400,
-                  justify="left").grid(row=len(rows) + 1, column=0, columnspan=3,
+                  justify="left").grid(row=row_wake + 2, column=0, columnspan=3,
                                        sticky="w", pady=(10, 0))
+
+        def _bad_time(text):
+            """返回 True 表示填了但不是合法的 HH:MM。"""
+            text = (text or "").strip()
+            if not text:
+                return False
+            return NetWorker._parse_daily(text) is None
 
         def ok():
             for k, v in lv.items():
                 try:
                     iv = int(v.get())
                     if k == "check_sec":
-                        iv = max(30, iv)
+                        iv = max(5, iv)
                     elif k == "idle_sec":
                         iv = max(30, iv)
                     elif k == "traffic_sec":
@@ -595,16 +702,27 @@ class App:
                 except ValueError:
                     v.set(str(cfgtool.DEFAULTS[k]))
                     self.cfg[k] = str(cfgtool.DEFAULTS[k])
+
+            daily = self.var_daily.get().strip()
+            if _bad_time(daily):
+                self.set_msg("定时重连时间格式不对，请填 HH:MM（例如 02:00）或留空")
+                return
+            if daily:
+                hh, mm = NetWorker._parse_daily(daily)
+                daily = "%02d:%02d" % (hh, mm)
+                self.var_daily.set(daily)
+            self.cfg["daily_reconnect"] = daily
+            self.cfg["wake_reconnect"] = "1" if self.var_wake.get() else "0"
             self.cfg["silent_start"] = "0" if self.var_startwin.get() else "1"
             cfgtool.save(self.cfg)
             self.worker.update_cfg(self.cfg)
             if cfgtool.get_autostart():
                 cfgtool.set_autostart(True, silent=as_bool(self.cfg["silent_start"]))
-            self.set_msg("设置已保存")
+            self.set_msg("设置已保存" + ("（每天 %s 定时重连）" % daily if daily else ""))
             w.destroy()
 
         btns = ttk.Frame(f, style="Card.TFrame")
-        btns.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        btns.grid(row=row_wake + 3, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="打开配置目录",
                    command=lambda: cfgtool.open_in_file_manager(
                        cfgtool.data_dir())).pack(side="left", padx=4)

@@ -32,8 +32,11 @@ DEFAULTS = {
     "keepalive": "1",
     "idle_sec": "150",            # 无流量多少秒后补一次流量
     "traffic_sec": "300",         # 补流量的周期
-    "check_sec": "45",            # 探活周期
+    "check_sec": "45",            # 探活周期（最小 5）
     "reconnect": "1",
+    "daily_reconnect": "",        # 每天定时重连，格式 HH:MM；留空不启用
+    "wake_reconnect": "1",        # 睡眠唤醒后立即重连
+    "want_online": "1",           # 用户是否希望在线；手动断开后置 0，重启也不再自动连
 }
 
 
