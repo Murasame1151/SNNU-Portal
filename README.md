@@ -188,7 +188,9 @@ Windows 上对应 `python main.py` / `python main.py --silent`。
 > 程序**不会**把它当成掉线去疯狂重连，只会保持现状并记录日志。
 
 ### 5. 其它细节
-* 单实例：重复启动会直接退出，不会出现两个程序互相抢认证。
+* 单实例：重复启动不会出现两个程序互相抢认证，而是把已经在跑的窗口唤到前台
+  （用 `--silent` 自启时仍然静默退出，不会平白弹窗）。
+* 托盘图标在资源管理器重启后会自动补回来，不会因为托盘区被清空而失去入口。
 * 日志：Windows 在 `%APPDATA%\CampusNetPortal\app.log`，
   Linux 在 `~/.config/CampusNetPortal/app.log`，
   记录认证/掉线/保活事件，超过 128 KB 自动截断。

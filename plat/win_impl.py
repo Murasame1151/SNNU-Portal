@@ -233,6 +233,8 @@ def net_bytes() -> int:
 # 单实例：命名互斥量（进程退出自动释放）
 # --------------------------------------------------------------------------- #
 _kernel32 = ctypes.windll.kernel32
+_kernel32.CreateMutexW.restype = wt.HANDLE
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
 _mutex_handle = None
 
 
@@ -240,8 +242,12 @@ def single_instance_lock(name: str) -> bool:
     """第一个实例拿到互斥量返回 True；已有实例在跑返回 False。"""
     global _mutex_handle
     try:
-        _kernel32.CreateMutexW(None, False, name)
-        _mutex_handle = True
+        handle = _kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True
+        # 句柄必须一直留着：进程退出时系统才会释放它，
+        # 否则第二个实例会误以为自己是唯一的。
+        _mutex_handle = handle
         return _kernel32.GetLastError() != 183      # ERROR_ALREADY_EXISTS
     except Exception:
         return True

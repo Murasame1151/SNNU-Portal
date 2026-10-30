@@ -27,7 +27,7 @@ import portal
 from cfgtool import as_bool, log
 
 APP_TITLE = "校园网自动认证"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -860,6 +860,17 @@ class App:
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
+def _activate_existing() -> bool:
+    """让已运行的实例把主界面显示出来（Windows 才有托盘窗口）。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        from trayicon import request_show
+        return request_show()
+    except Exception:
+        return False
+
+
 def main():
     args = [a.lower() for a in sys.argv[1:]]
     if "--version" in args or "-v" in args:
@@ -867,7 +878,16 @@ def main():
         return
     silent = "--silent" in args
     if not cfgtool.single_instance_lock():
-        log("已有实例在运行，本次退出")
+        # 已有实例在跑。用户双击 exe 时不能只是默默退出：托盘图标在资源管理器
+        # 重启后会丢，那时双击就是唯一能把界面找回来的办法。
+        shown = False
+        if not silent:
+            for _ in range(10):        # 对方可能刚启动，等它的托盘窗口建好
+                if _activate_existing():
+                    shown = True
+                    break
+                time.sleep(0.2)
+        log("已有实例在运行，%s" % ("已唤出主界面" if shown else "本次退出"))
         return
 
     cfg = cfgtool.load()

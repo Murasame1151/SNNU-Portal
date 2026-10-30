@@ -27,6 +27,10 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 WM_COMMAND = 0x0111
 WM_CLOSE = 0x0010
+WM_TRAY_SHOW = WM_APP + 2      # 第二个实例请求“把主界面显示出来”
+
+TRAY_CLASS = "CampusNetPortalTrayWnd"
+TRAY_TITLE = "CampusNetPortalTray"
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -71,12 +75,32 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wt.UINT
+user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
+user32.FindWindowW.restype = wt.HWND
+user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
+shell32.Shell_NotifyIconW.restype = wt.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.c_void_p]
 
 
 # --------------------------------------------------------------------------- #
 # 图标绘制已移到 iconart.py（Windows 用 ICO，Linux 用 PNG，共用同一套图形）
 # --------------------------------------------------------------------------- #
+
+
+def request_show() -> bool:
+    """请已在运行的实例把主界面显示出来。
+
+    第二个实例不创建自己的托盘窗口，而是给第一个实例的托盘窗口发一条
+    WM_TRAY_SHOW。找不到窗口（例如对方还没初始化完）时返回 False。
+    """
+    try:
+        hwnd = user32.FindWindowW(TRAY_CLASS, TRAY_TITLE)
+        if not hwnd:
+            return False
+        return bool(user32.PostMessageW(hwnd, WM_TRAY_SHOW, 0, 0))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +115,7 @@ class TrayIcon:
         self.autostart_checked = autostart_checked
         self.hwnd = None
         self.icon = None
+        self._taskbar_created = 0
         self._thread = None
         self._ready = threading.Event()
         self._wndproc = WNDPROC(self._proc)   # 必须保留引用，否则会被 GC
@@ -105,7 +130,9 @@ class TrayIcon:
     def _run(self):
         try:
             hinst = kernel32.GetModuleHandleW(None)
-            cls_name = "CampusNetPortalTrayWnd"
+            cls_name = TRAY_CLASS
+            # 资源管理器重启后会广播这条消息，收到就得重新添加托盘图标
+            self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
             wc = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
             wndclass = type("WNDCLASSW", (ctypes.Structure,), {"_fields_": [
                 ("style", wt.UINT), ("lpfnWndProc", wc),
@@ -119,7 +146,7 @@ class TrayIcon:
             user32.RegisterClassW(ctypes.byref(wndclass))
 
             self.hwnd = user32.CreateWindowExW(
-                0, cls_name, "CampusNetPortalTray", 0, 0, 0, 0, 0,
+                0, cls_name, TRAY_TITLE, 0, 0, 0, 0, 0,
                 None, None, hinst, None)
             if not self.hwnd:
                 return
@@ -193,6 +220,17 @@ class TrayIcon:
 
     # ---- 消息处理 ----
     def _proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_TRAY_SHOW:
+            self._safe(self.on_show)
+            return 0
+        if self._taskbar_created and msg == self._taskbar_created:
+            # 资源管理器重启后托盘区被清空，要重新添加一次图标，
+            # 否则图标就此消失，只能再开一个实例——而那正是“打不开”的由来。
+            try:
+                shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid()))
+            except Exception:
+                pass
+            return 0
         if msg == WM_TRAYICON:
             ev = lparam & 0xFFFF
             if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
